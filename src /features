@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+
+import argparse, os
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+def daily_aggregates(df: pd.DataFrame) -> pd.DataFrame:
+    df['date'] = pd.to_datetime(df['invoice_date']).dt.date
+    g = df.groupby(['date','country'], dropna=False).agg(
+        revenue=('revenue','sum'),
+        purchases=('invoice','nunique'),
+        stream_views=('stream_views','sum'),
+        stream_ids=('stream_id','nunique'),
+        customers=('customer_id','nunique'),
+    ).reset_index()
+    return g
+
+def add_rollups(g: pd.DataFrame) -> pd.DataFrame:
+    g = g.sort_values(['country','date'])
+    for w in (7,14,28):
+        g[f'rev_roll_{w}d'] = g.groupby('country')['revenue'].transform(lambda s: s.rolling(w, min_periods=1).sum())
+        g[f'views_roll_{w}d'] = g.groupby('country')['stream_views'].transform(lambda s: s.rolling(w, min_periods=1).sum())
+        g[f'cust_roll_{w}d'] = g.groupby('country')['customers'].transform(lambda s: s.rolling(w, min_periods=1).mean())
+    return g
+
+def monthly_aggregates(g: pd.DataFrame) -> pd.DataFrame:
+    g['month'] = pd.to_datetime(g['date']).astype('datetime64[M]')
+    m = g.groupby(['month','country'], dropna=False).agg(
+        revenue=('revenue','sum'),
+        purchases=('purchases','sum'),
+        stream_views=('stream_views','sum'),
+        customers=('customers','mean')
+    ).reset_index()
+    return m
+
+def main():
+    ap = argparse.ArgumentParser(description="Build daily and monthly aggregates")
+    ap.add_argument("--indir", default="data/compiled", help="Input directory with compiled.parquet")
+    ap.add_argument("--outdir", default="data/features", help="Output directory")
+    args = ap.parse_args()
+
+    compiled = pd.read_parquet(Path(args.indir) / "compiled.parquet")
+    daily = daily_aggregates(compiled)
+    daily = add_rollups(daily)
+    monthly = monthly_aggregates(daily)
+
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    daily.to_parquet(outdir / "daily.parquet", index=False)
+    monthly.to_parquet(outdir / "monthly.parquet", index=False)
+
+    print(f"Daily rows: {len(daily):,}  Monthly rows: {len(monthly):,}")
+    print("Saved daily.parquet and monthly.parquet")
+
+if __name__ == "__main__":
+    main()
