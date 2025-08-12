@@ -1,1 +1,105 @@
+#!/usr/bin/env python3
+
+import argparse, os, io, json, re, sys, gzip
+from pathlib import Path
+from typing import List
+import pandas as pd
+import numpy as np
+import requests
+from tqdm import tqdm
+
+AAVAIL_RAW_BASE = "https://raw.githubusercontent.com/aavail/ai-workflow-capstone/master/cs-train"
+
+def _fetch_url(url: str) -> bytes:
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def _list_json_files() -> List[str]:
+    # The training data lives under cs-train. File names are country shards.
+    # We don't have an index endpoint; use the known pattern found in the repo.
+    # Fallback list compiled from the repo structure.
+    shards = [f"data-{i:02d}.json" for i in range(1,51)]
+    return shards
+
+def load_all_json() -> pd.DataFrame:
+    dfs = []
+    for name in tqdm(_list_json_files(), desc="Downloading"):
+        url = f"{AAVAIL_RAW_BASE}/{name}"
+        try:
+            b = _fetch_url(url)
+        except requests.HTTPError:
+            # Skip missing shards quietly
+            continue
+        try:
+            obj = json.loads(b.decode("utf-8"))
+        except Exception:
+            # Some shards might be JSON lines
+            lines = [json.loads(line) for line in b.decode("utf-8").splitlines() if line.strip()]
+            obj = lines
+        df = pd.json_normalize(obj)
+        dfs.append(df)
+    if not dfs:
+        raise RuntimeError("No JSON was fetched. Check network or repo path.")
+    raw = pd.concat(dfs, ignore_index=True)
+    return raw
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    # Standardize columns expected from the course data
+    # Common fields include: invoice, country, customer_id, stream_id, stream_views,
+    # purchase, price, invoice_date
+    rename_map = {
+        'InvoiceNo': 'invoice',
+        'Country': 'country',
+        'CustomerID': 'customer_id',
+        'StreamID': 'stream_id',
+        'TimesViewed': 'stream_views',
+        'PaymentAmount': 'price',
+        'InvoiceDate': 'invoice_date',
+        'Purchase': 'purchase'
+    }
+    for k,v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df.rename(columns={k:v}, inplace=True)
+
+    # Types
+    if 'invoice_date' in df.columns:
+        df['invoice_date'] = pd.to_datetime(df['invoice_date'], errors='coerce', utc=True).dt.tz_convert(None)
+    if 'customer_id' in df.columns:
+        df['customer_id'] = pd.to_numeric(df['customer_id'], errors='coerce').astype('Int64')
+    if 'price' in df.columns:
+        df['price'] = pd.to_numeric(df['price'], errors='coerce')
+    if 'stream_views' in df.columns:
+        df['stream_views'] = pd.to_numeric(df['stream_views'], errors='coerce').fillna(0).astype(int)
+
+    # Basic filters
+    df = df.dropna(subset=['invoice_date'])
+    # Revenue per line
+    if 'price' in df.columns:
+        df['revenue'] = df['price'].clip(lower=0)
+    else:
+        df['revenue'] = 0.0
+    return df
+
+def save_outputs(df: pd.DataFrame, outdir: Path):
+    outdir.mkdir(parents=True, exist_ok=True)
+    # Full compiled parquet + sample CSV for quick look
+    df.to_parquet(outdir / "compiled.parquet", index=False)
+    df.head(1000).to_csv(outdir / "sample.csv", index=False)
+
+def main():
+    p = argparse.ArgumentParser(description="Compile JSON shards into a single table")
+    p.add_argument("--outdir", default="data/compiled", help="Output directory")
+    args = p.parse_args()
+
+    raw = load_all_json()
+    clean_df = clean(raw)
+    save_outputs(clean_df, Path(args.outdir))
+    print(f"Rows: {len(clean_df):,}  Countries: {clean_df['country'].nunique() if 'country' in clean_df.columns else 'n/a'}")
+    if 'invoice_date' in clean_df.columns:
+        span = (clean_df['invoice_date'].max() - clean_df['invoice_date'].min()).days
+        print(f"Date span: {span} days")
+
+if __name__ == "__main__":
+    main()
 
